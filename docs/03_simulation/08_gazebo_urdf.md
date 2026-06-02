@@ -4,10 +4,12 @@
 > - 시뮬레이터(Gazebo)가 왜 필요한지, ROS 2와 어떻게 연결되는지 이해한다.
 > - **Gazebo Harmonic**과 `ros_gz`(브리지/스폰)의 역할을 안다.
 > - URDF로 간단한 이동 로봇 모델을 기술한다.
+> - ROS 2 좌표계 규칙과 TF 프레임의 역할을 이해한다.
 > - 로봇을 Gazebo에 띄우고 RViz로 본다.
 
 > **이번 장의 산출물**
 > - URDF 로봇 모델을 RViz에서 확인하고 Gazebo Harmonic에 spawn한다.
+> - `base_link`, `odom`, `map`, 센서 프레임의 관계를 TF 트리로 확인한다.
 > - `ros_gz` bridge로 Gazebo와 ROS 2 토픽을 연결한다.
 >
 > **공통 학습 흐름**: 개념 → 따라하기 → 코드 해설 → 실행 확인 → 버전/환경 체크 → 트러블슈팅 → 연습문제 → 마무리 점검
@@ -129,6 +131,57 @@ RViz에서 `RobotModel` 디스플레이를 추가하고 Fixed Frame을 `base_lin
 
 ---
 
+### 좌표계와 TF 기초
+
+ROS 2에서 로봇 위치 문제의 절반은 좌표계 문제다. 특히 14장 SLAM과 15장 Nav2는
+`map → odom → base_link → 센서 프레임` 연결이 맞아야 정상 동작한다. 여기서 먼저 기본
+규칙을 잡고 간다.
+
+ROS의 대표 좌표 규칙은 다음과 같다.
+
+```text
+x: 로봇 전방
+y: 로봇 왼쪽
+z: 위쪽
+```
+
+주요 프레임은 역할이 다르다.
+
+| 프레임 | 의미 | 주로 쓰는 곳 |
+|---|---|---|
+| `base_link` | 로봇 본체 중심 | URDF, 센서 장착 기준 |
+| `base_footprint` | 바닥에 투영한 로봇 중심 | 2D 주행 로봇, Nav2 |
+| `base_scan` | 라이다 위치 | `/scan` 데이터 기준 |
+| `camera_link` | 카메라 본체 위치 | 영상·비전 처리 기준 |
+| `odom` | 바퀴 오도메트리 기준의 연속 좌표 | 짧은 시간 주행 추정 |
+| `map` | SLAM/Localization이 보정한 전역 지도 좌표 | Nav2 목표 좌표 |
+
+`robot_state_publisher`는 URDF의 link/joint를 읽어 `base_link → base_scan` 같은 정적
+관계를 TF로 발행한다. 반대로 `map → odom`은 SLAM이나 localization 노드가 만들고,
+`odom → base_link`는 오도메트리 노드가 만든다.
+
+RViz에서 Fixed Frame을 고를 때는 목적을 기준으로 정한다.
+
+- URDF 모양만 볼 때: `base_link`
+- 라이다와 로봇 모델 정합을 볼 때: `odom` 또는 `base_link`
+- SLAM/Nav2를 볼 때: `map`
+
+정적 센서를 임시로 붙여 볼 때는 `static_transform_publisher`로 프레임을 만들 수 있다.
+
+```bash
+ros2 run tf2_ros static_transform_publisher \
+  0.12 0 0.18 0 0 0 base_link camera_link
+
+ros2 run tf2_ros tf2_echo base_link camera_link
+ros2 run tf2_tools view_frames
+```
+
+`Pose`와 `Odometry` 메시지의 `header.frame_id`도 이 기준을 따른다. 예를 들어 15장에서
+Nav2 목표를 보낼 때 `goal.pose.header.frame_id = "map"`으로 지정하는 이유는, 목표 좌표가
+로봇 기준이 아니라 지도 기준이기 때문이다.
+
+---
+
 ## 8.5 [따라하기] Gazebo에 스폰하기
 
 Gazebo Harmonic을 띄우고, 그 안에 로봇을 생성(spawn)한다 — `ros_gz_sim` 기준.
@@ -178,8 +231,8 @@ Gazebo 안의 토픽(예: `/cmd_vel`)을 ROS에서 쓰려면 `ros_gz_bridge`를 
 
 ## 코드 해설 · 실행 확인 · 버전 체크
 
-- **코드 해설 포인트**: URDF link/joint, `robot_state_publisher`, `ros_gz_sim create`, `parameter_bridge` 연결을 해설한다.
-- **실행 확인 포인트**: RViz 모델, `gz sim`, `/clock`, `/cmd_vel`, `/scan` 토픽을 확인한다.
+- **코드 해설 포인트**: URDF link/joint, `robot_state_publisher`, TF 프레임, `ros_gz_sim create`, `parameter_bridge` 연결을 해설한다.
+- **실행 확인 포인트**: RViz 모델, TF 트리, `gz sim`, `/clock`, `/cmd_vel`, `/scan` 토픽을 확인한다.
 - **버전/환경 체크**: Gazebo Classic의 `gazebo_ros` 방식과 Harmonic의 `ros_gz` 방식을 구분한다.
 
 ## 8.6 트러블슈팅
@@ -188,6 +241,7 @@ Gazebo 안의 토픽(예: `/cmd_vel`)을 ROS에서 쓰려면 `ros_gz_bridge`를 
 |---|---|---|
 | `gz sim` 실행 안 됨 | ros_gz 미설치 | `sudo apt install ros-jazzy-ros-gz` |
 | 로봇이 안 보임 | URDF 오류/Fixed Frame 잘못 | RViz Fixed Frame=`base_link`, URDF 문법 확인 |
+| 라이다/카메라가 엉뚱한 위치에 보임 | 센서 프레임 TF 누락/오프셋 오류 | `tf2_echo`, `view_frames`로 `base_link → 센서` 확인 |
 | 스폰 실패 | Foxy(`spawn_entity.py`) 잔존 | `ros_gz_sim`의 `create`로 교체 |
 | cmd_vel이 Gazebo에 안 전달 | 브리지 없음/매핑 오타 | `ros_gz_bridge` 추가, `@` 매핑 확인 |
 | 화면이 느림(맥 VM) | GPU 가속 제한 | 단순 월드 사용, 부록 A의 VM 설정 참고 |
@@ -200,6 +254,7 @@ Gazebo 안의 토픽(예: `/cmd_vel`)을 ROS에서 쓰려면 `ros_gz_bridge`를 
 2. 본체 색을 바꾸는 `<material>`을 추가하라.
 3. `empty.sdf` 대신 다른 월드 파일로 Gazebo를 띄워 보라.
 4. `/cmd_vel` 브리지를 만들고 `ros2 topic pub`로 로봇을 움직여 보라.
+5. `static_transform_publisher`로 `base_link → camera_link`를 만들고 RViz TF 디스플레이에서 확인하라.
 
 ---
 
@@ -207,6 +262,7 @@ Gazebo 안의 토픽(예: `/cmd_vel`)을 ROS에서 쓰려면 `ros_gz_bridge`를 
 
 - [ ] Gazebo Harmonic과 `ros_gz_sim`/`ros_gz_bridge`의 역할을 안다.
 - [ ] URDF의 link/joint 구조로 간단한 로봇을 기술했다.
+- [ ] ROS 좌표축 규칙과 `map → odom → base_link → 센서` TF 흐름을 설명할 수 있다.
 - [ ] RViz로 모델을, Gazebo로 물리 시뮬을 띄웠다.
 - [ ] Foxy(Classic) → Jazzy(Harmonic) 스폰·브리지 차이를 안다.
 

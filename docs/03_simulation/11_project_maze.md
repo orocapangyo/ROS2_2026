@@ -4,11 +4,11 @@
 > - 액션으로 "미로를 빠져나가라"는 목표를 주고 진행을 피드백받는다.
 > - 라이다·오도메트리를 결합해 벽 따라가기(wall-following)를 구현한다.
 > - 막히거나 위험할 때 목표를 취소한다.
-> - (선택) OpenCV로 카메라 영상을 활용한다.
+> - OpenCV로 카메라 영상에서 출구 마커를 인식한다.
 
 > **이번 장의 산출물**
 > - Maze Escape 액션 서버/클라이언트를 작성한다.
-> - LaserScan, Odometry, 선택적 OpenCV 처리를 하나의 프로젝트로 통합한다.
+> - LaserScan, Odometry, OpenCV 출구 마커 인식을 하나의 프로젝트로 통합한다.
 >
 > **공통 학습 흐름**: 개념 → 따라하기 → 코드 해설 → 실행 확인 → 버전/환경 체크 → 트러블슈팅 → 연습문제 → 마무리 점검
 
@@ -161,18 +161,95 @@ ros2 action send_goal /escape_maze my_robot_interfaces/action/EscapeMaze \
 
 ---
 
-## 11.6 (선택) OpenCV로 카메라 활용
+## 11.6 OpenCV로 출구 마커 인식하기
 
-카메라가 있다면 `sensor_msgs/Image`를 구독해 `cv_bridge`로 OpenCV 영상으로 바꿔 출구
-표식(색·마커)을 인식할 수 있다.
+라이다와 오도메트리만으로도 미로 주행은 가능하지만, "출구"라는 의미 있는 장면을 인식하려면
+카메라가 유용하다. 이 절에서는 빨간 출구 마커를 예로 들어 `sensor_msgs/Image`를 OpenCV
+영상으로 바꾸고, HSV 색 마스크로 마커를 찾는다.
+
+설치:
+
+```bash
+sudo apt install -y ros-jazzy-cv-bridge python3-opencv
+```
+
+의존성:
+
+```xml
+<!-- package.xml -->
+<depend>sensor_msgs</depend>
+<depend>cv_bridge</depend>
+<exec_depend>python3-opencv</exec_depend>
+```
+
+카메라 토픽은 Gazebo/Harmonic 월드 구성에 따라 이름이 다를 수 있다. 먼저 토픽을 확인한다.
+
+```bash
+ros2 topic list | grep image
+ros2 topic info /camera/image_raw
+```
+
+빨간색 마커 검출 노드는 다음 흐름을 갖는다.
 
 ```python
+import cv2
+import rclpy
+from rclpy.node import Node
 from cv_bridge import CvBridge
-bridge = CvBridge()
-# image_callback 안에서:
-frame = bridge.imgmsg_to_cv2(msg, "bgr8")   # OpenCV 이미지
-# 색 마스킹·윤곽 검출 등으로 출구 표식 탐지
+from sensor_msgs.msg import Image
+from std_msgs.msg import Bool
+
+
+class ExitMarkerDetector(Node):
+    def __init__(self):
+        super().__init__("exit_marker_detector")
+        self.bridge = CvBridge()
+        self.seen_pub = self.create_publisher(Bool, "exit_marker_seen", 10)
+        self.create_subscription(Image, "camera/image_raw", self.on_image, 10)
+
+    def on_image(self, msg):
+        frame = self.bridge.imgmsg_to_cv2(msg, "bgr8")
+        hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+
+        lower1 = (0, 80, 80)
+        upper1 = (10, 255, 255)
+        lower2 = (170, 80, 80)
+        upper2 = (180, 255, 255)
+        mask = cv2.inRange(hsv, lower1, upper1) | cv2.inRange(hsv, lower2, upper2)
+
+        contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        area = max((cv2.contourArea(c) for c in contours), default=0.0)
+        seen = area > 1200.0
+
+        self.seen_pub.publish(Bool(data=seen))
+        if seen:
+            self.get_logger().info(f"출구 마커 감지: area={area:.0f}")
+
+
+def main():
+    rclpy.init()
+    rclpy.spin(ExitMarkerDetector())
+    rclpy.shutdown()
 ```
+
+Maze 액션 서버는 `exit_marker_seen`을 구독해 `escaped()` 판정에 반영한다.
+
+```python
+from std_msgs.msg import Bool
+
+# __init__ 안에서:
+self.exit_seen_ = False
+self.create_subscription(Bool, "exit_marker_seen", self.on_exit_seen, 10)
+
+def on_exit_seen(self, msg):
+    self.exit_seen_ = msg.data
+
+def escaped(self):
+    return self.exit_seen_
+```
+
+이제 미로 출구 근처에 빨간 표식을 두면, 주행 로직은 라이다로 벽을 따라가고 탈출 판정은
+OpenCV 마커 인식으로 수행한다. 이 구조가 센서 융합의 가장 작은 형태다.
 
 > 🔁 **Foxy → Jazzy 메모**: `cv_bridge`·OpenCV 연동 API는 거의 동일하다. 다만 의존 패키지
 > 이름·버전(예: `python3-opencv`)을 Jazzy 기준으로 설치하고, 카메라 토픽은 Harmonic
@@ -182,9 +259,9 @@ frame = bridge.imgmsg_to_cv2(msg, "bgr8")   # OpenCV 이미지
 
 ## 코드 해설 · 실행 확인 · 버전 체크
 
-- **코드 해설 포인트**: action goal/feedback/result, LaserScan/Odometry 제어 루프, cancel 처리를 해설한다.
-- **실행 확인 포인트**: goal 전송, feedback 관찰, cancel, 미로 탈출 동작을 확인한다.
-- **버전/환경 체크**: Jazzy 기준 custom action 빌드와 Gazebo bridge topic 구성을 점검한다.
+- **코드 해설 포인트**: action goal/feedback/result, LaserScan/Odometry 제어 루프, OpenCV HSV 마스크, cancel 처리를 해설한다.
+- **실행 확인 포인트**: goal 전송, feedback 관찰, `exit_marker_seen` 토픽, cancel, 미로 탈출 동작을 확인한다.
+- **버전/환경 체크**: Jazzy 기준 custom action 빌드, `cv_bridge`, Gazebo bridge topic 구성을 점검한다.
 
 ## 11.7 트러블슈팅
 
@@ -195,6 +272,7 @@ frame = bridge.imgmsg_to_cv2(msg, "bgr8")   # OpenCV 이미지
 | 무한 회전 | 규칙 충돌 | 전방·우측 조건 우선순위 점검 |
 | 취소가 안 됨 | `is_cancel_requested` 미검사 | 루프에 취소 체크 추가 |
 | `create_rate` 멈춤 | 단일 스레드 spin | 멀티스레드 executor 사용 검토 |
+| OpenCV 마커가 감지되지 않음 | 카메라 토픽/HSV 범위/조명 문제 | `ros2 topic echo exit_marker_seen`, HSV 범위와 면적 임계값 조정 |
 
 ---
 
@@ -203,7 +281,7 @@ frame = bridge.imgmsg_to_cv2(msg, "bgr8")   # OpenCV 이미지
 1. 좌벽 추종(왼손 법칙)으로 바꿔 동작을 비교하라.
 2. 피드백 `state`를 화면 대신 별도 토픽으로도 발행해 `rqt`로 관찰하라.
 3. 5초간 이동거리 변화가 없으면 "막힘"으로 보고 자동 취소하라.
-4. (도전) OpenCV로 빨간 출구 마커를 인식해 탈출 판정에 사용하라.
+4. OpenCV로 빨간 출구 마커를 인식해 탈출 판정에 사용하라.
 
 ---
 
@@ -211,6 +289,7 @@ frame = bridge.imgmsg_to_cv2(msg, "bgr8")   # OpenCV 이미지
 
 - [ ] 커스텀 액션으로 장시간 작업을 목표·피드백·결과로 모델링했다.
 - [ ] 라이다+오도메트리로 벽 따라가기를 구현했다.
+- [ ] OpenCV 출구 마커 인식을 `escaped()` 판정에 연결했다.
 - [ ] 취소로 안전하게 중단할 수 있다.
 - [ ] 토픽·서비스·액션을 한 프로젝트에서 통합해 보았다.
 
@@ -274,8 +353,8 @@ from rclpy.callback_groups import ReentrantCallbackGroup
 - **1번** 우/좌를 바꾼다: `right` 인덱스(`n//4`)를 `left`(`3n//4`)로, 회전 부호를 반대로.
 - **2번** `feedback.state`를 별도 `String` 토픽으로도 발행하고 `ros2 topic echo`/`rqt`로 관찰.
 - **3번** 위 11.10의 막힘 감지 + `abort()`가 정답.
-- **4번** `cv_bridge`로 영상을 받아 HSV 변환 후 빨간색 마스크의 면적이 임계 이상이면 출구로
-  판정해 `escaped()`에 반영.
+- **4번** `cv_bridge`로 영상을 받아 HSV 변환 후 빨간색 마스크의 면적이 임계 이상이면
+  `exit_marker_seen=True`를 발행하고, Maze 서버의 `escaped()`에서 이 값을 사용한다.
 
 ---
 
